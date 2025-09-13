@@ -1,159 +1,156 @@
-from flask import Flask, request, send_file, jsonify, render_template_string
-import pdfplumber
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
-from reportlab.lib import colors
-import tempfile
 import os
 import csv
+from io import BytesIO
+from flask import Flask, render_template, request, send_file, flash, redirect, url_for
+import pdfplumber
+from fpdf import FPDF
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET", "secret")
 
-# главная страница
+# Путь к CSV с именами CREW для выпадающего списка
+RA_CSV = os.path.join(os.getcwd(), "RA73331.csv")
+
+# helper: загрузить список CREW (колонка 0 из всех строк)
+def load_crew_list():
+    crew = []
+    if os.path.exists(RA_CSV):
+        try:
+            with open(RA_CSV, newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if len(row) > 0 and row[0].strip():
+                        crew.append(row[0].strip())
+        except Exception:
+            pass
+    return crew
+
+
 @app.route("/", methods=["GET"])
 def index():
-    crew_options = []
-    ra_csv = os.path.join(os.getcwd(), "RA73331.csv")
-    if os.path.exists(ra_csv):
-        with open(ra_csv, newline="", encoding="utf-8") as csvfile:
-            reader = csv.reader(csvfile)
-            for row in reader:
-                if len(row) > 0:
-                    crew_options.append(row[0])
-
-    html = """
-    <h1>PDF Upload</h1>
-    <form action="/process-pdf" method="post" enctype="multipart/form-data">
-        <label>Загрузите файл (PDF):</label><br>
-        <input type="file" name="file" required><br><br>
-
-        <label>CAPTAIN:</label><br>
-        <input type="text" name="captain" required><br><br>
-
-        <label>CREW:</label><br>
-        <select name="crew_choice" required>
-            {% for option in crew_options %}
-                <option value="{{ option }}">{{ option }}</option>
-            {% endfor %}
-        </select><br><br>
-
-        <label>BLOCK FUEL:</label><br>
-        <input type="number" name="block_fuel" required><br><br>
-
-        <input type="submit" value="Загрузить и обработать">
-    </form>
-    """
-    return render_template_string(html, crew_options=crew_options)
+    crew_list = load_crew_list()
+    return render_template("index.html", crew_list=crew_list)
 
 
 @app.route("/process-pdf", methods=["POST"])
 def process_pdf():
-    if "file" not in request.files:
-        return jsonify({"error": "Файл не загружен"}), 400
-
-    file = request.files["file"]
-    crew_choice = request.form.get("crew_choice", "")
+    # form fields
+    pdf_file = request.files.get("pdf")
     captain = request.form.get("captain", "")
-    block_fuel = request.form.get("block_fuel", "0")
+    crew_choice = request.form.get("crew", "")
+    block_fuel_raw = request.form.get("block_fuel", "")
+
+    if not pdf_file:
+        flash("No PDF uploaded")
+        return redirect(url_for("index"))
 
     try:
-        block_fuel_val = int(float(block_fuel))
-    except ValueError:
-        block_fuel_val = 0
+        block_fuel = int(float(block_fuel_raw))
+    except Exception:
+        block_fuel = 0
 
-    # временный файл для исходного pdf
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        file.save(tmp.name)
-        tmp_path = tmp.name
-
-    # извлекаем строки из pdf
-    lines = []
-    with pdfplumber.open(tmp_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                lines.extend(text.splitlines())
+    # Read only first page
+    try:
+        with pdfplumber.open(pdf_file) as pdf:
+            page = pdf.pages[0]
+            text = page.extract_text() or ""
+            lines = [ln for ln in text.splitlines()] if text else []
+    except Exception:
+        flash("Failed to read PDF")
+        return redirect(url_for("index"))
 
     if len(lines) < 24:
-        os.remove(tmp_path)
-        return jsonify({"error": "В PDF меньше 24 строк"}), 400
+        flash("PDF doesn't contain enough lines (need at least 24)")
+        return redirect(url_for("index"))
 
-    # строка 12
-    line12 = lines[11].split()
+    # extract required lines
+    def get_split(line_index):
+        try:
+            return lines[line_index].split()
+        except Exception:
+            return []
+
+    line12 = get_split(11)
+    line23 = get_split(22)
+    line24 = get_split(23)
+
     FLIGHT = line12[0] if len(line12) > 0 else ""
     REG = line12[1] if len(line12) > 1 else ""
     DATE = line12[2] if len(line12) > 2 else ""
+    DESTINATION = line12[3][-4:] if len(line12) > 3 else ""
 
-    # строка 23
-    line23 = lines[22].split()
-    try:
-        TAXI_FUEL = int(float(line23[2])) if len(line23) > 2 else 0
-    except ValueError:
-        TAXI_FUEL = 0
+    TAXI_FUEL = line23[2] if len(line23) > 2 else "0"
     DOW = line23[5] if len(line23) > 5 else ""
 
-    # строка 24
-    line24 = lines[23].split()
-    try:
-        TRIP_FUEL = int(float(line24[3])) if len(line24) > 3 else 0  # индекс 3
-    except ValueError:
-        TRIP_FUEL = 0
+    EET = line24[2] if len(line24) > 1 else ""
+    TRIP_FUEL = line24[3] if len(line24) > 2 else "0"
 
-    EET = line24[2] if len(line24) > 2 else ""  # индекс 2
+    def to_int_safe(x):
+        try:
+            return int(float(x))
+        except Exception:
+            return 0
 
-    SEATS_QUANTITY = "412"
+    TAXI_FUEL_INT = to_int_safe(TAXI_FUEL)
+    TRIP_FUEL_INT = to_int_safe(TRIP_FUEL)
+    BLOCK_FUEL_INT = block_fuel
+    TAKE_OF_FUEL = BLOCK_FUEL_INT - TAXI_FUEL_INT
 
-    # --- ищем DOI по CREW в CSV ---
-    CREW = crew_choice
+    # find DOI in REG.csv
     DOI = ""
-    csv_path = os.path.join(os.getcwd(), f"{REG}.csv")
-    if os.path.exists(csv_path):
-        with open(csv_path, newline="", encoding="utf-8") as csvfile:
-            reader = csv.reader(csvfile)
-            for row in reader:
-                if len(row) > 0 and row[0] == CREW:
-                    DOI = row[5] if len(row) > 5 else ""
-                    break
+    csv_by_reg = os.path.join(os.getcwd(), f"{REG}.csv")
+    if os.path.exists(csv_by_reg) and crew_choice:
+        try:
+            with open(csv_by_reg, newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if len(row) > 0 and row[0].strip() == crew_choice:
+                        DOI = row[5] if len(row) > 5 else ""
+                        break
+        except Exception:
+            DOI = ""
 
-    # --- TAKE OF FUEL ---
-    TAKE_OF_FUEL = block_fuel_val - TAXI_FUEL
-
-    # --- итоговые данные ---
-    ordered_data = [
+    # ordered output
+    ordered = [
         ("FLIGHT", FLIGHT),
         ("A/C", "B - 772"),
         ("REG", REG),
         ("CAPTAIN", captain),
-        ("CREW", CREW),
+        ("CREW", crew_choice),
         ("DOW", DOW),
         ("DOI", DOI),
-        ("BLOCK FUEL", block_fuel_val),
-        ("TAXI FUEL", TAXI_FUEL),
+        ("DESTINATION", DESTINATION),
+        ("BLOCK FUEL", BLOCK_FUEL_INT),
+        ("TAXI FUEL", TAXI_FUEL_INT),
         ("TAKE OF FUEL", TAKE_OF_FUEL),
-        ("TRIP FUEL", TRIP_FUEL),
+        ("TRIP FUEL", TRIP_FUEL_INT),
         ("EET", EET),
-        ("SEATS QUANTITY", SEATS_QUANTITY),
+        ("SEATS QUANTITY", 412),
         ("DATE", DATE),
     ]
 
-    # создаем новый PDF
-    output_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    doc = SimpleDocTemplate(output_pdf.name, pagesize=A4)
+    # PDF
+    pdf_out = FPDF()
+    pdf_out.set_auto_page_break(auto=True, margin=15)
+    pdf_out.add_page()
+    pdf_out.set_font("Arial", size=12)
 
-    data = [[k, v] for k, v in ordered_data]  # без шапки Key/Value
+    pdf_out.cell(0, 10, "Flight data", ln=True, align="C")
+    pdf_out.ln(4)
 
-    table = Table(data, hAlign="LEFT")
-    table.setStyle(TableStyle([
-        ("GRID", (0, 0), (-1, -1), 1, colors.black),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-    ]))
+    col1_w = 60
+    for key, val in ordered:
+        pdf_out.set_font("Arial", size=11)
+        pdf_out.cell(col1_w, 9, f"{key}", border=1)
+        pdf_out.cell(0, 9, str(val), border=1, ln=True)
 
-    doc.build([table])
+    # ✅ теперь правильно возвращаем PDF как байты
+    pdf_bytes = pdf_out.output(dest="S").encode("latin1")
+    output = BytesIO(pdf_bytes)
+    output.seek(0)
 
-    os.remove(tmp_path)
-
-    return send_file(output_pdf.name, as_attachment=True, download_name="result.pdf")
+    return send_file(output, as_attachment=True, download_name="result.pdf", mimetype="application/pdf")
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
