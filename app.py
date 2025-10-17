@@ -1,16 +1,12 @@
 import os
 import csv
-from io import BytesIO
-from flask import Flask, render_template, request, send_file, flash, redirect, url_for
+from flask import Flask, render_template, request, flash, redirect, url_for
 import pdfplumber
-from fpdf import FPDF
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", "secret")
 
-# Путь к CSV с именами CREW для выпадающего списка
 RA_CSV = os.path.join(os.getcwd(), "RA73331.csv")
-
 
 def load_crew_list():
     """Загружает список CREW из RA73331.csv (первый столбец)"""
@@ -26,12 +22,10 @@ def load_crew_list():
             pass
     return crew
 
-
 @app.route("/", methods=["GET"])
 def index():
     crew_list = load_crew_list()
     return render_template("index.html", crew_list=crew_list)
-
 
 @app.route("/process-pdf", methods=["POST"])
 def process_pdf():
@@ -49,7 +43,7 @@ def process_pdf():
     except Exception:
         block_fuel = 0
 
-    # Читаем первую страницу PDF
+    # Чтение первой страницы PDF
     try:
         with pdfplumber.open(pdf_file) as pdf:
             page = pdf.pages[0]
@@ -63,24 +57,22 @@ def process_pdf():
         flash("PDF doesn't contain enough lines")
         return redirect(url_for("index"))
 
-    # Функция для безопасного сплита строки
     def split_line(idx):
         try:
             return lines[idx].split()
         except Exception:
             return []
 
-    # Извлекаем 12 строку
+    # 12 строка
     line12 = split_line(11)
     FLIGHT = line12[0] if len(line12) > 0 else ""
     REG = line12[1] if len(line12) > 1 else ""
     DATE = line12[2] if len(line12) > 2 else ""
     DESTINATION = line12[3][-4:] if len(line12) > 3 else ""
 
-    # --- Логика для TAXI и TRIP FUEL (поиск по содержимому строк) ---
+    # TAXI и TRIP FUEL
     line_taxi = []
     line_trip = []
-
     for ln in lines:
         parts = ln.split()
         if not parts:
@@ -92,13 +84,10 @@ def process_pdf():
         if line_taxi and line_trip:
             break
 
-    # Если не найдено, присваиваем дефолты
     TAXI_FUEL = line_taxi[2] if len(line_taxi) > 2 else "0"
     DOW = line_taxi[5] if len(line_taxi) > 5 else ""
-
-    # <-- изменено: TRIP_FUEL теперь берётся из индекса 4 -->
     EET = line_trip[1] if len(line_trip) > 1 else ""
-    TRIP_FUEL = line_trip[3] if len(line_trip) > 3 else "0"
+    TRIP_FUEL = line_trip[3] if len(line_trip) > 3 else "0"  # индекс 4
 
     def to_int_safe(x):
         try:
@@ -109,9 +98,8 @@ def process_pdf():
     TAXI_FUEL_INT = to_int_safe(TAXI_FUEL)
     TRIP_FUEL_INT = to_int_safe(TRIP_FUEL)
     BLOCK_FUEL_INT = block_fuel
-    TAKE_OF_FUEL = BLOCK_FUEL_INT - TAXI_FUEL_INT
+    TAKE_OFF_FUEL = BLOCK_FUEL_INT - TAXI_FUEL_INT
 
-    # --- Ищем DOI в CSV с именем REG ---
     DOI = ""
     csv_by_reg = os.path.join(os.getcwd(), f"{REG}.csv")
     if os.path.exists(csv_by_reg) and crew_choice:
@@ -125,7 +113,6 @@ def process_pdf():
         except Exception:
             DOI = ""
 
-    # --- Формируем PDF ---
     ordered = [
         ("FLIGHT", FLIGHT),
         ("A/C", "B - 772"),
@@ -137,34 +124,14 @@ def process_pdf():
         ("DESTINATION", DESTINATION),
         ("BLOCK FUEL", BLOCK_FUEL_INT),
         ("TAXI FUEL", TAXI_FUEL_INT),
-        ("TAKE OF FUEL", TAKE_OF_FUEL),
+        ("TAKE OFF FUEL", TAKE_OFF_FUEL),
         ("TRIP FUEL", TRIP_FUEL_INT),
         ("EET", EET),
         ("SEATS QUANTITY", 412),
         ("DATE", DATE),
     ]
 
-    pdf_out = FPDF()
-    pdf_out.set_auto_page_break(auto=True, margin=15)
-    pdf_out.add_page()
-    pdf_out.set_font("helvetica", size=12)
-
-    pdf_out.cell(0, 10, "Flight data", ln=True, align="C")
-    pdf_out.ln(4)
-
-    col1_w = 60
-    for key, val in ordered:
-        pdf_out.set_font("helvetica", size=11)
-        pdf_out.cell(col1_w, 9, f"{key}", border=1)
-        pdf_out.cell(0, 9, str(val), border=1, ln=True)
-
-    # Генерация PDF в память
-    pdf_bytes = pdf_out.output(dest="S").encode("latin1")
-    output = BytesIO(pdf_bytes)
-    output.seek(0)
-
-    return send_file(output, as_attachment=True, download_name="result.pdf", mimetype="application/pdf")
-
+    return render_template("result.html", ordered=ordered)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
